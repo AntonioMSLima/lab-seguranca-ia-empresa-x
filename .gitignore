@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.db
+dashboard_kibana_simulado.png
+grafico_anomalias.png
