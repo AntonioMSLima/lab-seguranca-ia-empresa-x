@@ -1,54 +1,159 @@
-import sqlite3
+﻿import sqlite3
+from pathlib import Path
+
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
+
 from sklearn.ensemble import IsolationForest
+from sklearn.metrics import (
+    confusion_matrix,
+    classification_report
+)
 
-# --- PASSO 1: Ingestão e Carga dos Dados via SQLite ---
-conn = sqlite3.connect('seguranca_logs.db')
-query = "SELECT packet_size, connection_duration, login_attempts FROM network_logs"
-df = pd.read_sql(query, conn)
-conn.close()
+BASE = Path(__file__).resolve().parent
+BANCO = BASE / "seguranca_logs.db"
 
-print(f"[+] Dados carregados do SQLite com sucesso! Total de registros: {len(df)}")
+# 1. Carregamento dos dados
+with sqlite3.connect(BANCO) as conn:
+    df = pd.read_sql_query(
+        "SELECT * FROM network_logs ORDER BY id",
+        conn
+    )
 
-# --- PASSO 2: Processamento com Pandas ---
-# Selecionamos as colunas numéricas que servirão de features para o modelo
-X = df[['packet_size', 'connection_duration', 'login_attempts']]
+if df.empty:
+    raise ValueError("O banco nao possui eventos para analisar.")
 
-# --- PASSO 3: Inteligência Artificial (Isolation Forest) ---
-# Configuramos o Isolation Forest com uma taxa de anomalia estimada de 5% (contamination=0.05)
-iso_forest = IsolationForest(contamination=0.05, random_state=42)
-df['anomaly_score'] = iso_forest.fit_predict(X)
+print(f"\nEventos carregados: {len(df)}")
 
-# O Isolation Forest retorna -1 para anomalias e 1 para dados normais
-# Vamos mapear para uma legibilidade melhor no relatório (True = Anomalia, False = Normal)
-df['is_anomaly'] = df['anomaly_score'] == -1
+# 2. Selecao das variaveis numericas
+# ground_truth NAO entra no treinamento.
+features = [
+    "packet_size",
+    "connection_duration",
+    "login_attempts",
+    "request_count",
+    "requests_per_minute"
+]
 
-n_anomalias = df['is_anomaly'].sum()
-print(f"[+] Análise de IA concluída. Foram detectadas {n_anomalias} anomalias no tráfego.")
+X = df[features].copy()
 
-# --- PASSO 4: Geração de Evidências Gráficas (Matplotlib) ---
+if X.isnull().any().any():
+    raise ValueError("Existem valores ausentes nas variaveis do modelo.")
+
+# 3. Treinamento e deteccao
+# A contaminacao corresponde a proporcao de eventos suspeitos
+# criada artificialmente nesta simulacao.
+proporcao_suspeitos = (
+    (df["ground_truth"] == "suspeito").sum() / len(df)
+)
+
+modelo = IsolationForest(
+    n_estimators=200,
+    contamination=proporcao_suspeitos,
+    random_state=42
+)
+
+previsoes = modelo.fit_predict(X)
+
+df["is_anomaly"] = previsoes == -1
+
+# Quanto maior o valor, mais anomalo o evento.
+df["anomaly_score"] = -modelo.decision_function(X)
+
+df["prediction"] = df["is_anomaly"].map({
+    True: "suspeito",
+    False: "normal"
+})
+
+# 4. Avaliacao usando os rotulos conhecidos da simulacao
+y_real = df["ground_truth"]
+y_pred = df["prediction"]
+
+print("\n===== RESULTADO DA DETECCAO =====")
+print(f"Eventos analisados: {len(df)}")
+print(f"Anomalias detectadas: {df['is_anomaly'].sum()}")
+print(f"Eventos classificados como normais: {(~df['is_anomaly']).sum()}")
+
+print("\n===== MATRIZ DE CONFUSAO =====")
+matriz = confusion_matrix(
+    y_real,
+    y_pred,
+    labels=["normal", "suspeito"]
+)
+
+print(pd.DataFrame(
+    matriz,
+    index=["Real normal", "Real suspeito"],
+    columns=["Previsto normal", "Previsto suspeito"]
+))
+
+print("\n===== METRICAS DE AVALIACAO =====")
+print(classification_report(
+    y_real,
+    y_pred,
+    labels=["normal", "suspeito"],
+    zero_division=0
+))
+
+# 5. Persistencia dos resultados
+colunas = [
+    "id",
+    "timestamp",
+    "source_ip",
+    "scenario",
+    "ground_truth",
+    "prediction",
+    "is_anomaly",
+    "anomaly_score"
+]
+
+resultados = df[colunas].copy()
+
+with sqlite3.connect(BANCO) as conn:
+    resultados.to_sql(
+        "ia_results",
+        conn,
+        if_exists="replace",
+        index=False
+    )
+
+resultados.to_csv(
+    BASE / "resultados_ia.csv",
+    index=False,
+    encoding="utf-8-sig"
+)
+
+print("\nResultados gravados no SQLite e em resultados_ia.csv.")
+
+# 6. Geracao do grafico
+normais = df[~df["is_anomaly"]]
+anomalias = df[df["is_anomaly"]]
+
 plt.figure(figsize=(10, 6))
 
-# Separar dados normais e anômalos para colorir no gráfico
-normal_data = df[~df['is_anomaly']]
-anomaly_data = df[df['is_anomaly']]
+plt.scatter(
+    normais["packet_size"],
+    normais["requests_per_minute"],
+    label="Classificados como normais",
+    alpha=0.6
+)
 
-plt.scatter(normal_data['packet_size'], normal_data['connection_duration'], 
-            c='blue', label='Tráfego Normal', alpha=0.6, s=30)
-plt.scatter(anomaly_data['packet_size'], anomaly_data['connection_duration'], 
-            c='red', label='Anomalias Detectadas (IA)', marker='x', s=100, linewidths=2)
+plt.scatter(
+    anomalias["packet_size"],
+    anomalias["requests_per_minute"],
+    label="Anomalias identificadas",
+    marker="x",
+    s=80
+)
 
-plt.title('Detecção de Anomalias em Segurança de Rede (Isolation Forest)')
-plt.xlabel('Tamanho do Pacote (Bytes)')
-plt.ylabel('Duração da Conexão (Segundos)')
+plt.title("Deteccao de Anomalias - Isolation Forest")
+plt.xlabel("Tamanho do pacote (bytes)")
+plt.ylabel("Requisicoes por minuto")
 plt.legend()
-plt.grid(True, linestyle='--', alpha=0.5)
+plt.grid(True, alpha=0.3)
 
-# Salvar o gráfico como imagem para anexar ao relatório
-plt.savefig('grafico_anomalias.png', dpi=300)
-print("[+] Gráfico salvo com sucesso como 'grafico_anomalias.png'.")
+plt.savefig(BASE / "grafico_anomalias.png", dpi=200)
 
-# Exibir o gráfico na tela
+print("Grafico salvo em grafico_anomalias.png")
+
 plt.show()
